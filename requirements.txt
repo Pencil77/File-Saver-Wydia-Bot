@@ -1,0 +1,7 @@
+pyrogram==2.0.106
+tgcrypto==1.2.5
+tqdm==4.66.4
+python-dotenv==1.0.1
+google-api-python-client==2.140.0
+google-auth==2.32.0
+google-auth-httplib2==0.2.0

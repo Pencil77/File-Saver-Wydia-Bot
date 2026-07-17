@@ -1,0 +1,20 @@
+# Secrets - never commit these
+.env
+service-account.json
+*.json
+!package.json
+
+# Pyrogram session files (contain your bot's live login session)
+*.session
+*.session-journal
+
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Local runtime artifacts
+/tmp/
+file2link_downloads/
+*.log

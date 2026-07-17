@@ -1,7 +1,3 @@
-# File2Link-Wydia-Telegram-Bot
-
-Telegram bot to save the files from telegram to google drive or share somewhere else
-
 # File2Link — Ubuntu / Cloud Shell version
 
 Migrates the old Colab notebook bot to a plain Python app. Downloads
@@ -20,15 +16,20 @@ no OAuth browser flow.
 5. Note the service account's email address, e.g.
    `file2link@your-project.iam.gserviceaccount.com`.
 
-## 2. Share the Drive folder with the service account
+## 2. Share each Drive folder with the service account
 
-1. In Google Drive, open the Shared Drive you were using before
-   (e.g. `Depot6_Index_Paper`), or the specific folder inside it.
+Repeat for every Shared Drive you want the bot to be able to upload to
+(e.g. `Depot7_Open_Paper`, `Depot6_Index_Paper`, `Depot26_Deep_Sea`,
+`Depot2_Common_Drive`):
+
+1. In Google Drive, open the Shared Drive (or the specific folder inside it).
 2. Share it with the service account's email address, giving it
    **Content Manager** (or higher) access.
 3. Grab the **folder ID** from the folder's URL:
    `https://drive.google.com/drive/folders/<THIS_IS_THE_FOLDER_ID>`
-4. Grab the **Shared Drive ID** the same way from the Shared Drive's URL.
+
+You'll end up with one `Name:folder_id` pair per drive — these go into
+`GOOGLE_DRIVES` in your `.env` (see below).
 
 ## 3. Cloud Shell setup (persists in $HOME across sessions)
 
@@ -55,11 +56,55 @@ after Cloud Shell resets:
 ```bash
 tmux new -s file2link
 source venv/bin/activate
+
+# Basic — pick drive per file via buttons
 python3 main.py
+
+# Always use drive #2, no button prompt
+python3 main.py --drive 2
+
+# Get an "I'm up" message when the bot starts (needs TELEGRAM_OWNER_CHAT_ID in .env)
+python3 main.py --notify-startup
+
+# Auto-stop after 2 hours, waiting for in-progress transfers to finish first
+python3 main.py --auto-stop-minutes 120 --auto-stop-mode soft
+
+# Auto-stop after 30 minutes no matter what's running
+python3 main.py --auto-stop-minutes 30 --auto-stop-mode hard
+
 # detach with: Ctrl+B then D
 ```
 
 To reattach later: `tmux attach -t file2link`
+
+**Getting your chat ID:** send `/start` to the bot once — it replies with
+your chat ID, which you then paste into `TELEGRAM_OWNER_CHAT_ID` in `.env`.
+
+**Drive selection:**
+- `GOOGLE_DRIVES` in `.env` defines the drives in order — that order is
+  what `--drive N` and the button numbering refer to (1-indexed).
+- One drive configured → always used, `--drive` ignored.
+- Multiple drives, no `--drive` → every incoming file gets a "choose
+  destination" keyboard in Telegram before anything downloads/uploads.
+
+**In-chat commands (available anytime the bot is running):**
+- `/status` — live progress of every active transfer: which stage
+  (Telegram→App download or App→Drive upload), % complete, speed, and ETA.
+- `/stop` — stop the bot. If a transfer is active, you'll be asked to
+  choose **Soft Stop** (waits for transfers to finish) or **Hard Stop**
+  (stops immediately, interrupting anything in progress).
+- `/help` — reminds you these commands exist.
+
+**Startup notification (`--notify-startup`, off by default):** sends a
+"Hi, I'm up!" message to `TELEGRAM_OWNER_CHAT_ID` when the bot starts,
+including which drive is active, the auto-stop setting, and a reminder
+that `/status` and `/stop` exist.
+
+**Auto-stop (`--auto-stop-minutes`, disabled by default):** stops the bot
+automatically after N minutes.
+- `--auto-stop-mode soft` (default) waits for any in-progress transfer
+  to finish before stopping — nothing gets interrupted.
+- `--auto-stop-mode hard` stops immediately at the deadline, even mid-transfer.
 
 Since Cloud Shell recycles the VM, you'll need to re-run
 `tmux new -s file2link && source venv/bin/activate && python3 main.py`
@@ -99,3 +144,4 @@ each machine you run this on needs its own `.env` and
   runs unmodified on any Ubuntu VM (e.g. a free-tier GCE e2-micro) — at
   that point you could switch to a proper `systemd` service for
   always-on behavior instead of `tmux`.
+
