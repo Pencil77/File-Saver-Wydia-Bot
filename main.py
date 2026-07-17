@@ -31,7 +31,7 @@ import uuid
 
 from dotenv import load_dotenv
 from pyrogram import Client, filters
-from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from pyrogram.types import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup
 from tqdm import tqdm
 
 from google.oauth2 import service_account
@@ -264,7 +264,7 @@ drive_service = get_drive_service()
 def upload_to_drive(local_path: str, file_name: str, folder_id: str, progress_cb=None) -> str:
     """Uploads a file to the given Drive folder. Returns the webViewLink."""
     file_metadata = {"name": file_name, "parents": [folder_id]}
-    media = MediaFileUpload(local_path, resumable=True, chunksize=10 * 1024 * 1024)
+    media = MediaFileUpload(local_path, resumable=True, chunksize=50 * 1024 * 1024)
 
     request = drive_service.files().create(
         body=file_metadata,
@@ -290,6 +290,7 @@ app = Client(
     api_hash=API_HASH,
     bot_token=BOT_TOKEN,
     ipv6=False,
+    max_concurrent_transmissions=6,  # parallel download/upload chunks (default: 1)
 )
 
 
@@ -406,6 +407,53 @@ async def process_upload(message, drive: dict, status_msg=None):
             pass
 
 
+def status_text() -> str:
+    if not active_transfers:
+        return "💤 No active transfers right now."
+    lines = [transfer_summary(t) for t in active_transfers.values()]
+    return "📊 **Active transfers:**\n\n" + "\n\n".join(lines)
+
+
+def main_menu_buttons(chat_id) -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton("📊 Status", callback_data="quick:status")]]
+    if is_admin(chat_id):
+        rows.append([InlineKeyboardButton("🛑 Stop", callback_data="quick:stop")])
+    rows.append([InlineKeyboardButton("❓ Help", callback_data="quick:help")])
+    return InlineKeyboardMarkup(rows)
+
+
+def stop_menu(chat_id):
+    """Returns (text, InlineKeyboardMarkup) for the stop confirmation prompt."""
+    if active_transfers:
+        text = (
+            f"⚠️ {len(active_transfers)} transfer(s) currently in progress.\n"
+            f"How would you like to stop?\n\n"
+            f"🟢 **Soft stop** — wait for them to finish, then stop\n"
+            f"🔴 **Hard stop** — stop immediately, interrupting them"
+        )
+        buttons = [
+            [
+                InlineKeyboardButton("🟢 Soft Stop", callback_data="stop:soft"),
+                InlineKeyboardButton("🔴 Hard Stop", callback_data="stop:hard"),
+            ],
+            [InlineKeyboardButton("❌ Cancel", callback_data="stop:cancel")],
+        ]
+    else:
+        text = "No active transfers. Stop the bot now?"
+        buttons = [
+            [InlineKeyboardButton("🛑 Stop", callback_data="stop:hard")],
+            [InlineKeyboardButton("❌ Cancel", callback_data="stop:cancel")],
+        ]
+    return text, InlineKeyboardMarkup(buttons)
+
+
+HELP_TEXT = (
+    "**Available commands:**\n"
+    "/status — see live progress (%, speed, ETA) of any transfer in progress\n"
+    "/stop — stop the bot (admin only; asks Soft/Hard if a transfer is active)"
+)
+
+
 @app.on_message(filters.command("start"))
 async def cmd_start(client, message):
     await message.reply_text(
@@ -413,7 +461,8 @@ async def cmd_start(client, message):
         f"Send me a video or document and I'll upload it to Drive.\n\n"
         f"**Commands:**\n"
         f"/status — see progress of active transfers\n"
-        f"/stop — stop the bot (admin only)"
+        f"/stop — stop the bot (admin only)",
+        reply_markup=main_menu_buttons(message.chat.id),
     )
 
 
@@ -424,20 +473,12 @@ async def cmd_id(client, message):
 
 @app.on_message(filters.command("help"))
 async def cmd_help(client, message):
-    await message.reply_text(
-        "**Available commands:**\n"
-        "/status — see live progress (%, speed, ETA) of any transfer in progress\n"
-        "/stop — stop the bot (asks for confirmation, and hard/soft if a transfer is active)"
-    )
+    await message.reply_text(HELP_TEXT, reply_markup=main_menu_buttons(message.chat.id))
 
 
 @app.on_message(filters.command("status"))
 async def cmd_status(client, message):
-    if not active_transfers:
-        await message.reply_text("💤 No active transfers right now.")
-        return
-    lines = [transfer_summary(t) for t in active_transfers.values()]
-    await message.reply_text("📊 **Active transfers:**\n\n" + "\n\n".join(lines))
+    await message.reply_text(status_text())
 
 
 @app.on_message(filters.command("stop"))
@@ -445,26 +486,28 @@ async def cmd_stop(client, message):
     if not is_admin(message.chat.id):
         await message.reply_text("🚫 Only the admin can stop this bot.")
         return
+    text, markup = stop_menu(message.chat.id)
+    await message.reply_text(text, reply_markup=markup)
 
-    if active_transfers:
-        text = (
-            f"⚠️ {len(active_transfers)} transfer(s) currently in progress.\n"
-            f"How would you like to stop?\n\n"
-            f"🟢 **Soft stop** — wait for them to finish, then stop\n"
-            f"🔴 **Hard stop** — stop immediately, interrupting them"
-        )
-        buttons = [
-            [InlineKeyboardButton("🟢 Soft Stop", callback_data="stop:soft")],
-            [InlineKeyboardButton("🔴 Hard Stop", callback_data="stop:hard")],
-            [InlineKeyboardButton("❌ Cancel", callback_data="stop:cancel")],
-        ]
-    else:
-        text = "No active transfers. Stop the bot now?"
-        buttons = [
-            [InlineKeyboardButton("🛑 Stop", callback_data="stop:hard")],
-            [InlineKeyboardButton("❌ Cancel", callback_data="stop:cancel")],
-        ]
-    await message.reply_text(text, reply_markup=InlineKeyboardMarkup(buttons))
+
+@app.on_callback_query(filters.regex(r"^quick:"))
+async def handle_quick_action(client, callback_query):
+    _, action = callback_query.data.split(":")
+    chat_id = callback_query.message.chat.id
+
+    if action == "status":
+        await callback_query.answer()
+        await callback_query.message.reply_text(status_text())
+    elif action == "help":
+        await callback_query.answer()
+        await callback_query.message.reply_text(HELP_TEXT, reply_markup=main_menu_buttons(chat_id))
+    elif action == "stop":
+        if not is_admin(chat_id):
+            await callback_query.answer("Only the admin can stop this bot.", show_alert=True)
+            return
+        await callback_query.answer()
+        text, markup = stop_menu(chat_id)
+        await callback_query.message.reply_text(text, reply_markup=markup)
 
 
 @app.on_callback_query(filters.regex(r"^stop:"))
@@ -498,10 +541,14 @@ async def handle_media(client, message):
 
     token = secrets.token_hex(4)
     pending_uploads[token] = message
-    buttons = [
-        [InlineKeyboardButton(d["name"], callback_data=f"drv:{token}:{i}")]
-        for i, d in enumerate(DRIVES)
-    ]
+    
+    # Build 2-column button grid
+    buttons = []
+    for i, d in enumerate(DRIVES):
+        if i % 2 == 0:  # start a new row every 2 buttons
+            buttons.append([])
+        buttons[-1].append(InlineKeyboardButton(d["name"], callback_data=f"drv:{token}:{i}"))
+    
     media = message.video or message.document
     file_name = getattr(media, "file_name", None) or "video.mp4"
     await message.reply_text(
@@ -535,6 +582,15 @@ async def main():
     async with app:
         me = await app.get_me()
         log.info(f"Authenticated as: @{me.username} (id={me.id})")
+
+        await app.set_bot_commands([
+            BotCommand("start", "Show welcome message and quick-action buttons"),
+            BotCommand("status", "See progress of active transfers"),
+            BotCommand("stop", "Stop the bot (admin only)"),
+            BotCommand("id", "Get your chat ID"),
+            BotCommand("help", "List available commands"),
+        ])
+
         log.info("Bot is listening...")
 
         if args.notify_startup:
@@ -547,8 +603,12 @@ async def main():
                         f"📂 Drive: `{drive_note}`\n"
                         f"⏱️ Auto-stop: "
                         f"{f'{args.auto_stop_minutes} min ({args.auto_stop_mode})' if args.auto_stop_minutes else 'disabled'}\n\n"
-                        f"Send me a video/document to upload it.\n"
-                        f"Use /status anytime to check progress, or /stop to shut me down.",
+                        f"**Available Commands:**\n"
+                        f"/start — welcome message\n"
+                        f"/status — live progress of active transfers\n"
+                        f"/id — get your chat ID\n"
+                        f"/stop — stop the bot (admin only)\n\n"
+                        f"Send me a video or document to get started!",
                     )
                 except Exception as e:
                     log.warning(f"notify-startup was set but sending the message failed: {e}")
