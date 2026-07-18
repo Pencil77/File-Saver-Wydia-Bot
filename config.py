@@ -25,12 +25,13 @@ SEEDR_TOKEN = os.getenv("SEEDR_TOKEN")
 # Backward-compatible aliases for older code/commits.
 BOT_TOKEN = TELEGRAM_BOT_TOKEN
 
-DRIVES = {
-    "1": {"name": "Depot7_Open_Paper", "folder_id": os.getenv("FOLDER_ID_1")},
-    "2": {"name": "Depot6_Index_Paper", "folder_id": os.getenv("FOLDER_ID_2")},
-    "3": {"name": "Depot26_Deep_Sea", "folder_id": os.getenv("FOLDER_ID_3")},
-    "4": {"name": "Depot2_Common_Drive", "folder_id": os.getenv("FOLDER_ID_4")},
-}
+# main.py expects a list of drive dicts, not a dict keyed by numbers.
+DRIVES = [
+    {"name": "Depot7_Open_Paper", "folder_id": os.getenv("FOLDER_ID_1")},
+    {"name": "Depot6_Index_Paper", "folder_id": os.getenv("FOLDER_ID_2")},
+    {"name": "Depot26_Deep_Sea", "folder_id": os.getenv("FOLDER_ID_3")},
+    {"name": "Depot2_Common_Drive", "folder_id": os.getenv("FOLDER_ID_4")},
+]
 FIXED_DRIVE = os.getenv("FIXED_DRIVE")
 
 parser = argparse.ArgumentParser(description="File-Saver-Wydia-Bot")
