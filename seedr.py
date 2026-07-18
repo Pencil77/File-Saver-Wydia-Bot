@@ -33,6 +33,7 @@ def add_magnet(magnet: str, token: str) -> int:
     hash_match = re.search(r"xt=urn:btih:([a-zA-Z0-9]+)", magnet, re.IGNORECASE)
     if hash_match:
         magnet = f"magnet:?xt=urn:btih:{hash_match.group(1)}"
+    print("MAGNET LEN:", len(magnet), "PREFIX:", magnet[:120])
     result = _post("transfer/magnet", token, {"magnet": magnet})
     if result.get("error"):
         raise RuntimeError(f"Seedr API Error: {result.get('error')}")
