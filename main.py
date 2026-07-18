@@ -1,214 +1,85 @@
 """
-File2Link Telegram Bot
-----------------------
-Listens for videos/documents sent to a Telegram bot, downloads them locally,
-then uploads them to a Google Drive Shared Drive folder using a service
-account (no OAuth browser flow, no rclone).
-
-Features:
-- Multiple destination Shared Drives (pick via --drive N or Telegram buttons)
-- Live progress tracking (console logs + on-demand /status in Telegram)
-- "I'm up" startup notification (on by default; disable with --no-notify-startup)
-- Auto-stop after N minutes, hard or soft (--auto-stop-minutes / --auto-stop-mode)
-- /stop command with confirmation + hard/soft choice, for manual shutdown
+File Saver Wydia Bot — main.py
+-------------------------------
+Telegram bot that saves files to Google Drive.
+Two intake paths:
+  • Direct file/video  → download from Telegram → upload to Drive
+  • Magnet link        → queue on Seedr → download from Seedr → upload to Drive
 
 Run:
-    python3 main.py
-    python3 main.py --drive 2
-    python3 main.py --notify-startup
-    python3 main.py --auto-stop-minutes 120 --auto-stop-mode soft
+    python main.py
+    python main.py --drive 2
+    python main.py --auto-stop-minutes 30 --auto-stop-mode hard
+    python main.py --no-notify-startup
 """
 
-import argparse
 import asyncio
-import logging
 import os
 import secrets
-import signal
-import sys
 import time
-import uuid
 
-from dotenv import load_dotenv
 from pyrogram import Client, filters
 from pyrogram.types import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup
 from tqdm import tqdm
 
-from google.oauth2 import service_account
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaFileUpload
-
-# ---------------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------------
-load_dotenv()
-
-API_ID = int(os.environ["TELEGRAM_API_ID"])
-API_HASH = os.environ["TELEGRAM_API_HASH"]
-BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-_owner_chat_id_raw = os.environ.get("TELEGRAM_OWNER_CHAT_ID")  # for startup notification + admin-only commands
-OWNER_CHAT_ID = int(_owner_chat_id_raw) if _owner_chat_id_raw else None
-
-
-def is_admin(chat_id) -> bool:
-    if not OWNER_CHAT_ID:
-        return False  # no admin configured -> nobody can use admin-only commands
-    return str(chat_id) == str(OWNER_CHAT_ID)
-
-SERVICE_ACCOUNT_FILE = os.environ["GOOGLE_SERVICE_ACCOUNT_FILE"]
-
-_raw_drives = os.environ["GOOGLE_DRIVES"]
-DRIVES = []
-for entry in _raw_drives.split(","):
-    name, folder_id = entry.strip().split(":", 1)
-    DRIVES.append({"name": name.strip(), "folder_id": folder_id.strip()})
-if not DRIVES:
-    raise SystemExit("No drives configured in GOOGLE_DRIVES (.env)")
-
-LOCAL_DOWNLOAD_PATH = os.environ.get("LOCAL_DOWNLOAD_PATH", "/tmp/file2link_downloads/")
-os.makedirs(LOCAL_DOWNLOAD_PATH, exist_ok=True)
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-log = logging.getLogger("file2link")
-
-# ---------------------------------------------------------------------------
-# CLI args
-# ---------------------------------------------------------------------------
-parser = argparse.ArgumentParser(description="File2Link Telegram Bot")
-parser.add_argument(
-    "--drive", type=int, default=None,
-    help=f"Drive number to always upload to (1-{len(DRIVES)}). Omit to choose per-file via buttons.",
+# Local modules
+from config import (
+    ARGS, DRIVES, FIXED_DRIVE, LOCAL_DOWNLOAD_PATH,
+    OWNER_CHAT_ID, SEEDR_TOKEN,
+    TELEGRAM_API_ID, TELEGRAM_API_HASH, TELEGRAM_BOT_TOKEN,
+    is_admin, log,
 )
-parser.add_argument(
-    "--notify-startup", dest="notify_startup", action="store_true", default=True,
-    help="Send an 'I'm up' message to TELEGRAM_OWNER_CHAT_ID on startup. On by default.",
+from drive import upload_to_drive
+from seedr import (
+    add_magnet, delete_folder, delete_torrent,
+    download_file, list_files, poll_torrent,
 )
-parser.add_argument(
-    "--no-notify-startup", dest="notify_startup", action="store_false",
-    help="Disable the startup notification.",
+from transfers import (
+    active_transfers,
+    format_bytes, format_eta,
+    new_transfer, remove_transfer,
+    transfer_summary, update_transfer,
 )
-parser.add_argument(
-    "--auto-stop-minutes", type=float, default=None,
-    help="Automatically stop the bot after this many minutes. Disabled by default.",
-)
-parser.add_argument(
-    "--auto-stop-mode", choices=["hard", "soft"], default="soft",
-    help="How to auto-stop: 'hard' stops immediately, 'soft' waits for active transfers to finish. Default: soft.",
-)
-args = parser.parse_args()
-
-FIXED_DRIVE = None
-if len(DRIVES) == 1:
-    FIXED_DRIVE = DRIVES[0]
-    log.info(f"Only one drive configured — using '{FIXED_DRIVE['name']}' for all uploads.")
-elif args.drive is not None:
-    if not (1 <= args.drive <= len(DRIVES)):
-        raise SystemExit(f"--drive must be between 1 and {len(DRIVES)}")
-    FIXED_DRIVE = DRIVES[args.drive - 1]
-    log.info(f"Using fixed drive: '{FIXED_DRIVE['name']}' (all uploads, no prompting)")
-else:
-    log.info("No --drive given. Will prompt per file: " + ", ".join(
-        f"{i+1}={d['name']}" for i, d in enumerate(DRIVES)
-    ))
-
-# token -> pyrogram Message, for pending drive-choice buttons
-pending_uploads = {}
 
 # ---------------------------------------------------------------------------
-# Transfer tracking (shared by console logs, /status, and progress edits)
+# Pyrogram client
 # ---------------------------------------------------------------------------
-active_transfers = {}  # transfer_id -> dict
+app = Client(
+    "file2link_session",
+    api_id=TELEGRAM_API_ID,
+    api_hash=TELEGRAM_API_HASH,
+    bot_token=TELEGRAM_BOT_TOKEN,
+    ipv6=False,
+    max_concurrent_transmissions=6,
+)
 
-
-def format_bytes(n):
-    for unit in ["B", "KB", "MB", "GB", "TB"]:
-        if n < 1024:
-            return f"{n:.1f}{unit}"
-        n /= 1024
-    return f"{n:.1f}PB"
-
-
-def format_eta(seconds):
-    if seconds is None or seconds <= 0 or seconds == float("inf"):
-        return "—"
-    seconds = int(seconds)
-    m, s = divmod(seconds, 60)
-    h, m = divmod(m, 60)
-    if h:
-        return f"{h}h {m}m"
-    if m:
-        return f"{m}m {s}s"
-    return f"{s}s"
-
-
-def new_transfer(file_name, stage, total_bytes, chat_id):
-    tid = uuid.uuid4().hex[:8]
-    active_transfers[tid] = {
-        "file_name": file_name,
-        "stage": stage,             # "downloading" or "uploading"
-        "current": 0,
-        "total": total_bytes,
-        "speed": 0.0,
-        "start_time": time.monotonic(),
-        "last_time": time.monotonic(),
-        "last_bytes": 0,
-        "chat_id": chat_id,
-    }
-    return tid
-
-
-def update_transfer(tid, current):
-    t = active_transfers.get(tid)
-    if not t:
-        return
-    now = time.monotonic()
-    dt = now - t["last_time"]
-    if dt > 0:
-        t["speed"] = (current - t["last_bytes"]) / dt
-    t["current"] = current
-    t["last_time"] = now
-    t["last_bytes"] = current
-
-
-def transfer_summary(t):
-    pct = int(t["current"] / t["total"] * 100) if t["total"] else 0
-    speed = t["speed"]
-    remaining = t["total"] - t["current"]
-    eta = remaining / speed if speed > 0 else None
-    stage_label = "⏬ Telegram → App" if t["stage"] == "downloading" else "☁️ App → Drive"
-    return (
-        f"{stage_label}: `{t['file_name']}`\n"
-        f"   {pct}% ({format_bytes(t['current'])}/{format_bytes(t['total'])}) "
-        f"@ {format_bytes(speed)}/s, ETA {format_eta(eta)}"
-    )
-
-
-def remove_transfer(tid):
-    active_transfers.pop(tid, None)
+# Pending drive-choice tokens
+pending_uploads: dict = {}   # token -> pyrogram Message
+pending_magnets: dict = {}   # token -> magnet string
 
 # ---------------------------------------------------------------------------
-# Shutdown control
+# Shutdown state
 # ---------------------------------------------------------------------------
 shutdown_event = asyncio.Event()
-shutting_down = False  # once True, stop accepting new files
+shutting_down = False
 
 
 async def initiate_shutdown(mode: str, notify_chat_id=None):
     global shutting_down
     shutting_down = True
-    log.info(f"Shutdown requested (mode={mode}). Active transfers: {len(active_transfers)}")
+    log.info(f"Shutdown requested (mode={mode}). Active: {len(active_transfers)}")
 
     if notify_chat_id:
         try:
             if mode == "hard" and active_transfers:
                 await app.send_message(
                     notify_chat_id,
-                    f"🔴 **Hard stop:** terminating now, {len(active_transfers)} transfer(s) will be interrupted.",
+                    f"🔴 **Hard stop:** terminating now, {len(active_transfers)} transfer(s) interrupted.",
                 )
             elif mode == "soft" and active_transfers:
                 await app.send_message(
                     notify_chat_id,
-                    f"🟢 **Soft stop:** waiting for {len(active_transfers)} active transfer(s) to finish...",
+                    f"🟢 **Soft stop:** waiting for {len(active_transfers)} transfer(s) to finish...",
                 )
             else:
                 await app.send_message(notify_chat_id, "🛑 Stopping bot now.")
@@ -217,93 +88,117 @@ async def initiate_shutdown(mode: str, notify_chat_id=None):
 
     if mode == "hard":
         log.warning("Hard stop: terminating immediately.")
-
-        async def _force_exit():
-            await asyncio.sleep(1)  # brief grace period to flush the notify message
+        async def _force():
+            await asyncio.sleep(1)
             os._exit(0)
-
-        asyncio.create_task(_force_exit())
+        asyncio.create_task(_force())
         shutdown_event.set()
         return
 
-    # soft stop: wait until no active transfers remain
     while active_transfers:
-        log.info(f"Soft stop waiting on {len(active_transfers)} active transfer(s)...")
+        log.info(f"Soft stop: waiting on {len(active_transfers)} transfer(s)...")
         await asyncio.sleep(5)
 
-    log.info("Soft stop: no active transfers remain, shutting down.")
     if notify_chat_id:
         try:
-            await app.send_message(notify_chat_id, "✅ All transfers finished. Bot is stopping now.")
+            await app.send_message(notify_chat_id, "✅ All transfers done. Stopping now.")
         except Exception:
             pass
     shutdown_event.set()
 
 
 async def auto_stop_watchdog():
-    if args.auto_stop_minutes is None:
+    if ARGS.auto_stop_minutes is None:
         return
-    await asyncio.sleep(args.auto_stop_minutes * 60)
-    log.info(f"Auto-stop timer reached ({args.auto_stop_minutes} min, mode={args.auto_stop_mode}).")
-    await initiate_shutdown(args.auto_stop_mode, notify_chat_id=OWNER_CHAT_ID)
+    await asyncio.sleep(ARGS.auto_stop_minutes * 60)
+    log.info(f"Auto-stop timer reached ({ARGS.auto_stop_minutes} min, {ARGS.auto_stop_mode})")
+    await initiate_shutdown(ARGS.auto_stop_mode, notify_chat_id=OWNER_CHAT_ID)
+
 
 # ---------------------------------------------------------------------------
-# Google Drive client (service account, no browser auth needed)
+# Shared helpers
 # ---------------------------------------------------------------------------
-SCOPES = ["https://www.googleapis.com/auth/drive"]
 
-def get_drive_service():
-    creds = service_account.Credentials.from_service_account_file(
-        SERVICE_ACCOUNT_FILE, scopes=SCOPES
-    )
-    return build("drive", "v3", credentials=creds, cache_discovery=False)
-
-drive_service = get_drive_service()
-
-
-def upload_to_drive(local_path: str, file_name: str, folder_id: str, progress_cb=None) -> str:
-    """Uploads a file to the given Drive folder. Returns the webViewLink."""
-    file_metadata = {"name": file_name, "parents": [folder_id]}
-    media = MediaFileUpload(local_path, resumable=True, chunksize=50 * 1024 * 1024)
-
-    request = drive_service.files().create(
-        body=file_metadata,
-        media_body=media,
-        fields="id, webViewLink",
-        supportsAllDrives=True,
-    )
-
-    response = None
-    while response is None:
-        status, response = request.next_chunk()
-        if status and progress_cb:
-            progress_cb(status.resumable_progress, status.total_size)
-
-    return response.get("webViewLink")
-
-# ---------------------------------------------------------------------------
-# Telegram bot
-# ---------------------------------------------------------------------------
-app = Client(
-    "file2link_session",
-    api_id=API_ID,
-    api_hash=API_HASH,
-    bot_token=BOT_TOKEN,
-    ipv6=False,
-    max_concurrent_transmissions=6,  # parallel download/upload chunks (default: 1)
-)
-
-
-async def safe_edit(msg, text):
+async def safe_edit(msg, text: str):
     try:
         await msg.edit_text(text)
     except Exception:
         pass
 
 
-async def process_upload(message, drive: dict, status_msg=None):
+def drive_choice_buttons(token: str) -> InlineKeyboardMarkup:
+    rows = []
+    for i, d in enumerate(DRIVES):
+        if i % 2 == 0:
+            rows.append([])
+        rows[-1].append(InlineKeyboardButton(d["name"], callback_data=f"drv:{token}:{i}"))
+    return InlineKeyboardMarkup(rows)
+
+
+# ---------------------------------------------------------------------------
+# Core upload path: local file → Drive
+# ---------------------------------------------------------------------------
+
+async def upload_local_to_drive(
+    local_path: str,
+    file_name: str,
+    file_size: int,
+    drive: dict,
+    chat_id,
+    status_msg,
+    reply_target,
+):
+    ul_tid = new_transfer(file_name, "uploading", file_size, chat_id)
+    loop = asyncio.get_event_loop()
+    last_edit = time.monotonic()
+    last_log = time.monotonic()
+
+    def upload_progress(current, total):
+        nonlocal last_edit, last_log
+        total = total or file_size
+        update_transfer(ul_tid, current)
+        now = time.monotonic()
+        if now - last_log > 5:
+            last_log = now
+            log.info(transfer_summary(active_transfers[ul_tid]).replace("\n   ", " "))
+        if now - last_edit > 4:
+            last_edit = now
+            t = active_transfers[ul_tid]
+            pct = int(current / total * 100) if total else 0
+            eta = format_eta((total - current) / t["speed"]) if t["speed"] > 0 else "—"
+            asyncio.run_coroutine_threadsafe(
+                safe_edit(
+                    status_msg,
+                    f"⚡ **Processing:** `{file_name}`\n"
+                    f"☁️ Uploading to '{drive['name']}': {pct}% "
+                    f"@ {format_bytes(t['speed'])}/s, ETA {eta}"
+                ),
+                loop,
+            )
+
+    link = await loop.run_in_executor(
+        None,
+        lambda: upload_to_drive(local_path, file_name, drive["folder_id"], upload_progress),
+    )
+    remove_transfer(ul_tid)
+    os.remove(local_path)
+
+    await safe_edit(status_msg, f"🏁 **Task Finished:** `{file_name}`")
+    await reply_target.reply_text(
+        f"✅ **Saved to Drive!**\n\n"
+        f"📂 **Drive:** `{drive['name']}`\n"
+        f"💾 **File:** `{file_name}`\n"
+        f"🔗 **Link:** {link}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Path A: Telegram file → local → Drive
+# ---------------------------------------------------------------------------
+
+async def process_tg_upload(message, drive: dict, status_msg=None):
     media = message.video or message.document
-    file_name = getattr(media, "file_name", None) or "video.mp4"
+    file_name = getattr(media, "file_name", None) or "file.mp4"
     file_size = getattr(media, "file_size", 0) or 1
     local_path = os.path.join(LOCAL_DOWNLOAD_PATH, file_name)
     chat_id = message.chat.id
@@ -350,55 +245,16 @@ async def process_upload(message, drive: dict, status_msg=None):
         await status_msg.edit_text(
             f"⚡ **Processing:** `{file_name}`\n☁️ Uploading to '{drive['name']}'..."
         )
-
-        ul_tid = new_transfer(file_name, "uploading", file_size, chat_id)
-        loop = asyncio.get_event_loop()
-        last_upload_edit = time.monotonic()
-        last_upload_log = time.monotonic()
-
-        def upload_progress(current, total):
-            nonlocal last_upload_edit, last_upload_log
-            total = total or file_size
-            update_transfer(ul_tid, current)
-            now = time.monotonic()
-            if now - last_upload_log > 5:
-                last_upload_log = now
-                log.info(transfer_summary(active_transfers[ul_tid]).replace("\n   ", " "))
-            if now - last_upload_edit > 4:
-                last_upload_edit = now
-                t = active_transfers[ul_tid]
-                pct = int(current / total * 100) if total else 0
-                eta = format_eta((total - current) / t["speed"]) if t["speed"] > 0 else "—"
-                asyncio.run_coroutine_threadsafe(
-                    safe_edit(
-                        status_msg,
-                        f"⚡ **Processing:** `{file_name}`\n"
-                        f"☁️ Uploading to '{drive['name']}': {pct}% @ {format_bytes(t['speed'])}/s, ETA {eta}"
-                    ),
-                    loop,
-                )
-
-        link = await loop.run_in_executor(
-            None,
-            lambda: upload_to_drive(local_path, file_name, drive["folder_id"], upload_progress),
+        await upload_local_to_drive(
+            local_path, file_name, file_size,
+            drive, chat_id, status_msg, message,
         )
-        remove_transfer(ul_tid)
-        os.remove(local_path)
-
-        await status_msg.edit_text(f"🏁 **Task Finished:** `{file_name}`")
-        await message.reply_text(
-            f"✅ **Saved to Drive!**\n\n"
-            f"📂 **Drive:** `{drive['name']}`\n"
-            f"💾 **File:** `{file_name}`\n"
-            f"🔗 **Link:** {link}"
-        )
-        log.info(f"Uploaded: {file_name} -> {drive['name']} -> {link}")
 
     except Exception as e:
         pbar.close()
         remove_transfer(dl_tid)
         remove_transfer(locals().get("ul_tid", ""))
-        log.exception(f"Failed on {file_name}")
+        log.exception(f"TG upload failed: {file_name}")
         if os.path.exists(local_path):
             os.remove(local_path)
         try:
@@ -406,6 +262,155 @@ async def process_upload(message, drive: dict, status_msg=None):
         except Exception:
             pass
 
+
+# ---------------------------------------------------------------------------
+# Path B: Magnet → Seedr → local → Drive
+# ---------------------------------------------------------------------------
+
+async def process_magnet(magnet: str, drive: dict, chat_id, status_msg):
+    if not SEEDR_TOKEN:
+        await safe_edit(status_msg, "❌ SEEDR_TOKEN not set in .env — magnet links not available.")
+        return
+
+    loop = asyncio.get_event_loop()
+    
+    # State tracking variables for the finally block
+    torrent_id = None
+    folder_id = None
+
+    try:
+        # 1. Submit magnet to Seedr
+        await safe_edit(status_msg, "🌱 **Submitting magnet to Seedr...**")
+        torrent_id = await loop.run_in_executor(
+            None, lambda: add_magnet(magnet, SEEDR_TOKEN)
+        )
+
+        # 2. Poll until Seedr finishes downloading the torrent
+        await safe_edit(status_msg, "🌱 **Seedr is downloading the torrent...**\n0%")
+        last_edit = time.monotonic()
+
+        def poll_progress(name, pct, size):
+            nonlocal last_edit
+            now = time.monotonic()
+            if now - last_edit > 4:
+                last_edit = now
+                asyncio.run_coroutine_threadsafe(
+                    safe_edit(status_msg,
+                        f"🌱 **Seedr downloading:** `{name[:50]}`\n{pct}%"
+                    ),
+                    loop,
+                )
+
+        torrent_status = await loop.run_in_executor(
+            None, lambda: poll_torrent(torrent_id, SEEDR_TOKEN, poll_progress)
+        )
+
+        folder_id = torrent_status.get("folder_id")
+        if not folder_id:
+            raise RuntimeError(f"Seedr torrent finished but no folder_id in response: {torrent_status}")
+
+        # 3. List files in the completed folder
+        await safe_edit(status_msg, "🌱 **Seedr done! Listing files...**")
+        files = await loop.run_in_executor(
+            None, lambda: list_files(folder_id, SEEDR_TOKEN)
+        )
+
+        if not files:
+            raise RuntimeError("Seedr folder is empty after torrent completed.")
+
+        log.info(f"Seedr folder {folder_id} has {len(files)} file(s): {[f['name'] for f in files]}")
+
+        # 4. Download each file from Seedr → local → Drive
+        for idx, file_info in enumerate(files):
+            file_name = file_info["name"]
+            file_size = file_info["size"] or 1
+            local_path = os.path.join(LOCAL_DOWNLOAD_PATH, file_name)
+
+            if os.path.exists(local_path):
+                os.remove(local_path)
+
+            dl_tid = new_transfer(file_name, "seedr_to_shell", file_size, chat_id)
+            pbar = tqdm(total=file_size, desc=f"⏬ Seedr {file_name}", unit="B", unit_scale=True)
+            last_dl_edit = time.monotonic()
+            last_dl_log = time.monotonic()
+
+            def dl_progress(current, total):
+                nonlocal last_dl_edit, last_dl_log
+                pbar.update(current - pbar.n)
+                update_transfer(dl_tid, current)
+                now = time.monotonic()
+                if now - last_dl_log > 5:
+                    last_dl_log = now
+                    log.info(transfer_summary(active_transfers[dl_tid]).replace("\n   ", " "))
+                if now - last_dl_edit > 4:
+                    last_dl_edit = now
+                    t = active_transfers[dl_tid]
+                    pct = int(current / total * 100) if total else 0
+                    eta = format_eta((total - current) / t["speed"]) if t["speed"] > 0 else "—"
+                    asyncio.run_coroutine_threadsafe(
+                        safe_edit(status_msg,
+                            f"⏬ **Seedr → App** ({idx+1}/{len(files)}): `{file_name}`\n"
+                            f"{pct}% @ {format_bytes(t['speed'])}/s, ETA {eta}"
+                        ),
+                        loop,
+                    )
+
+            # Use a fake message object as reply target for final link reply
+            class _ReplyProxy:
+                def __init__(self, chat_id, bot):
+                    self._cid = chat_id
+                    self._bot = bot
+                async def reply_text(self, text):
+                    await self._bot.send_message(self._cid, text)
+
+            await loop.run_in_executor(
+                None, lambda fi=file_info: download_file(
+                    fi["id"], fi["name"], SEEDR_TOKEN, LOCAL_DOWNLOAD_PATH, dl_progress
+                )
+            )
+            pbar.close()
+            remove_transfer(dl_tid)
+
+            await safe_edit(
+                status_msg,
+                f"⚡ **Processing:** `{file_name}`\n☁️ Uploading to '{drive['name']}'..."
+            )
+            
+            # The Drive upload can fail. Since it's inside the try block, it will jump 
+            # to except, and then finally, ensuring Seedr is cleaned up.
+            await upload_local_to_drive(
+                local_path, file_name, file_size,
+                drive, chat_id, status_msg,
+                _ReplyProxy(chat_id, app),
+            )
+
+    except Exception as e:
+        log.exception("Magnet upload failed")
+        try:
+            await app.send_message(chat_id, f"❌ **Magnet failed:** {e}")
+        except Exception:
+            pass
+            
+    finally:
+        # 5. Guaranteed Cleanup of Seedr to free quota
+        if folder_id:
+            try:
+                await loop.run_in_executor(None, lambda: delete_folder(folder_id, SEEDR_TOKEN))
+                log.info(f"Seedr cleanup done for folder {folder_id}")
+            except Exception as e:
+                log.error(f"Failed to delete folder {folder_id} from Seedr: {e}")
+        elif torrent_id:
+            # If it timed out or failed before becoming a folder, delete the torrent
+            try:
+                await loop.run_in_executor(None, lambda: delete_torrent(torrent_id, SEEDR_TOKEN))
+                log.info(f"Seedr cleanup done for torrent {torrent_id}")
+            except Exception as e:
+                log.error(f"Failed to delete torrent {torrent_id} from Seedr: {e}")
+
+
+# ---------------------------------------------------------------------------
+# UI helpers
+# ---------------------------------------------------------------------------
 
 def status_text() -> str:
     if not active_transfers:
@@ -423,13 +428,11 @@ def main_menu_buttons(chat_id) -> InlineKeyboardMarkup:
 
 
 def stop_menu(chat_id):
-    """Returns (text, InlineKeyboardMarkup) for the stop confirmation prompt."""
     if active_transfers:
         text = (
-            f"⚠️ {len(active_transfers)} transfer(s) currently in progress.\n"
-            f"How would you like to stop?\n\n"
-            f"🟢 **Soft stop** — wait for them to finish, then stop\n"
-            f"🔴 **Hard stop** — stop immediately, interrupting them"
+            f"⚠️ {len(active_transfers)} transfer(s) in progress.\n\n"
+            f"🟢 **Soft stop** — wait for them to finish\n"
+            f"🔴 **Hard stop** — stop immediately"
         )
         buttons = [
             [
@@ -449,19 +452,26 @@ def stop_menu(chat_id):
 
 HELP_TEXT = (
     "**Available commands:**\n"
-    "/status — see live progress (%, speed, ETA) of any transfer in progress\n"
-    "/stop — stop the bot (admin only; asks Soft/Hard if a transfer is active)"
+    "/status — live progress (%, speed, ETA)\n"
+    "/stop — stop the bot (admin only)\n"
+    "/magnet <link> — save a torrent via Seedr → Drive\n"
+    "/id — get your chat ID\n"
+    "/help — this list"
 )
 
+# ---------------------------------------------------------------------------
+# Command handlers
+# ---------------------------------------------------------------------------
 
 @app.on_message(filters.command("start"))
 async def cmd_start(client, message):
     await message.reply_text(
-        f"Hi I am File Saver Bot! 👋\n\n"
-        f"Send me a video or document and I'll upload it to Drive.\n\n"
-        f"**Commands:**\n"
-        f"/status — see progress of active transfers\n"
-        f"/stop — stop the bot (admin only)",
+        "Hi I am File Saver Bot! 👋\n\n"
+        "Send me a video or document and I'll upload it to Drive.\n"
+        "Or send `/magnet <link>` to save a torrent via Seedr.\n\n"
+        "**Commands:**\n"
+        "/status — see progress of active transfers\n"
+        "/stop — stop the bot (admin only)",
         reply_markup=main_menu_buttons(message.chat.id),
     )
 
@@ -489,6 +499,43 @@ async def cmd_stop(client, message):
     text, markup = stop_menu(message.chat.id)
     await message.reply_text(text, reply_markup=markup)
 
+
+@app.on_message(filters.command("magnet"))
+async def cmd_magnet(client, message):
+    if shutting_down:
+        await message.reply_text("🛑 Bot is shutting down.")
+        return
+
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].startswith("magnet:"):
+        await message.reply_text(
+            "⚠️ Usage: `/magnet magnet:?xt=urn:btih:...`\n"
+            "Paste the full magnet link after the command."
+        )
+        return
+
+    magnet = parts[1].strip()
+
+    if FIXED_DRIVE is not None:
+        status_msg = await message.reply_text("🌱 Processing magnet link...")
+        asyncio.create_task(process_magnet(magnet, FIXED_DRIVE, message.chat.id, status_msg))
+        return
+
+    # Ask which drive
+    token = secrets.token_hex(4)
+    pending_magnets[token] = magnet
+    await message.reply_text(
+        f"📂 **Choose destination for magnet:**\n`{magnet[:60]}...`",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton(d["name"], callback_data=f"mdrv:{token}:{i}")]
+            for i, d in enumerate(DRIVES)
+        ]),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Callback handlers
+# ---------------------------------------------------------------------------
 
 @app.on_callback_query(filters.regex(r"^quick:"))
 async def handle_quick_action(client, callback_query):
@@ -532,50 +579,62 @@ async def handle_stop_choice(client, callback_query):
 @app.on_message(filters.video | filters.document)
 async def handle_media(client, message):
     if shutting_down:
-        await message.reply_text("🛑 Bot is shutting down and not accepting new files right now.")
+        await message.reply_text("🛑 Bot is shutting down.")
         return
 
     if FIXED_DRIVE is not None:
-        await process_upload(message, FIXED_DRIVE)
+        await process_tg_upload(message, FIXED_DRIVE)
         return
 
     token = secrets.token_hex(4)
     pending_uploads[token] = message
-    
-    # Build 2-column button grid
-    buttons = []
-    for i, d in enumerate(DRIVES):
-        if i % 2 == 0:  # start a new row every 2 buttons
-            buttons.append([])
-        buttons[-1].append(InlineKeyboardButton(d["name"], callback_data=f"drv:{token}:{i}"))
-    
     media = message.video or message.document
     file_name = getattr(media, "file_name", None) or "video.mp4"
     await message.reply_text(
         f"📂 **Choose destination for:**\n`{file_name}`",
-        reply_markup=InlineKeyboardMarkup(buttons),
+        reply_markup=drive_choice_buttons(token),
     )
 
 
 @app.on_callback_query(filters.regex(r"^drv:"))
 async def handle_drive_choice(client, callback_query):
     _, token, idx_str = callback_query.data.split(":")
-    idx = int(idx_str)
     original_message = pending_uploads.pop(token, None)
     if original_message is None:
-        await callback_query.answer("This request expired — please resend the file.", show_alert=True)
+        await callback_query.answer("Request expired — please resend the file.", show_alert=True)
         return
-
     if shutting_down:
-        await callback_query.answer("Bot is shutting down, try again after it restarts.", show_alert=True)
+        await callback_query.answer("Bot is shutting down.", show_alert=True)
         return
 
-    drive = DRIVES[idx]
+    drive = DRIVES[int(idx_str)]
     await callback_query.answer(f"Uploading to {drive['name']}...")
     status_msg = callback_query.message
     await status_msg.edit_reply_markup(reply_markup=None)
-    await process_upload(original_message, drive, status_msg=status_msg)
+    await process_tg_upload(original_message, drive, status_msg=status_msg)
 
+
+@app.on_callback_query(filters.regex(r"^mdrv:"))
+async def handle_magnet_drive_choice(client, callback_query):
+    _, token, idx_str = callback_query.data.split(":")
+    magnet = pending_magnets.pop(token, None)
+    if magnet is None:
+        await callback_query.answer("Request expired — please resend the magnet.", show_alert=True)
+        return
+    if shutting_down:
+        await callback_query.answer("Bot is shutting down.", show_alert=True)
+        return
+
+    drive = DRIVES[int(idx_str)]
+    await callback_query.answer(f"Processing via Seedr → {drive['name']}...")
+    status_msg = callback_query.message
+    await status_msg.edit_reply_markup(reply_markup=None)
+    asyncio.create_task(process_magnet(magnet, drive, callback_query.message.chat.id, status_msg))
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 
 async def main():
     log.info("Bot is starting...")
@@ -584,41 +643,38 @@ async def main():
         log.info(f"Authenticated as: @{me.username} (id={me.id})")
 
         await app.set_bot_commands([
-            BotCommand("start", "Show welcome message and quick-action buttons"),
+            BotCommand("start",  "Welcome message and quick-action buttons"),
             BotCommand("status", "See progress of active transfers"),
-            BotCommand("stop", "Stop the bot (admin only)"),
-            BotCommand("id", "Get your chat ID"),
-            BotCommand("help", "List available commands"),
+            BotCommand("magnet", "Save a torrent via Seedr → Drive"),
+            BotCommand("stop",   "Stop the bot (admin only)"),
+            BotCommand("id",     "Get your chat ID"),
+            BotCommand("help",   "List available commands"),
         ])
 
         log.info("Bot is listening...")
 
-        if args.notify_startup:
-            if OWNER_CHAT_ID:
-                try:
-                    drive_note = FIXED_DRIVE["name"] if FIXED_DRIVE else "prompted per file"
-                    await app.send_message(
-                        OWNER_CHAT_ID,
-                        f"✅ **Hi, I'm up!**\n\n"
-                        f"📂 Drive: `{drive_note}`\n"
-                        f"⏱️ Auto-stop: "
-                        f"{f'{args.auto_stop_minutes} min ({args.auto_stop_mode})' if args.auto_stop_minutes else 'disabled'}\n\n"
-                        f"**Available Commands:**\n"
-                        f"/start — welcome message\n"
-                        f"/status — live progress of active transfers\n"
-                        f"/id — get your chat ID\n"
-                        f"/stop — stop the bot (admin only)\n\n"
-                        f"Send me a video or document to get started!",
-                    )
-                except Exception as e:
-                    log.warning(f"notify-startup was set but sending the message failed: {e}")
-            else:
-                log.warning("--notify-startup was set but TELEGRAM_OWNER_CHAT_ID is not set in .env. Skipping.")
+        if ARGS.notify_startup and OWNER_CHAT_ID:
+            try:
+                drive_note = FIXED_DRIVE["name"] if FIXED_DRIVE else "prompted per file"
+                seedr_note = "✅ configured" if SEEDR_TOKEN else "❌ not configured (magnet links disabled)"
+                await app.send_message(
+                    OWNER_CHAT_ID,
+                    f"✅ **Hi, I'm up!**\n\n"
+                    f"📂 Drive: `{drive_note}`\n"
+                    f"🌱 Seedr: {seedr_note}\n"
+                    f"⏱️ Auto-stop: "
+                    f"{f'{ARGS.auto_stop_minutes} min ({ARGS.auto_stop_mode})' if ARGS.auto_stop_minutes else 'disabled'}\n\n"
+                    f"Send a file or `/magnet <link>` to get started!",
+                )
+            except Exception as e:
+                log.warning(f"Startup notification failed: {e}")
+        elif ARGS.notify_startup and not OWNER_CHAT_ID:
+            log.warning("notify-startup is on but TELEGRAM_OWNER_CHAT_ID is not set.")
 
-        watchdog_task = asyncio.create_task(auto_stop_watchdog())
+        watchdog = asyncio.create_task(auto_stop_watchdog())
         await shutdown_event.wait()
-        watchdog_task.cancel()
-        log.info("Shutting down bot client...")
+        watchdog.cancel()
+        log.info("Shutting down...")
 
     log.info("Bot stopped.")
 
@@ -629,4 +685,3 @@ if __name__ == "__main__":
         loop.run_until_complete(main())
     except KeyboardInterrupt:
         log.info("Interrupted by user (Ctrl+C).")
-

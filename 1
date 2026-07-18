@@ -1,0 +1,53 @@
+"""
+config.py — Full configuration for File-Saver-Wydia-Bot.
+Contains all required constants, drive mappings, and service initialization.
+"""
+
+import logging
+import os
+import argparse
+from googleapiclient.discovery import build
+from google.oauth2 import service_account
+
+# 1. Setup Logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
+log = logging.getLogger(__name__)
+
+# 2. Project Constants (Required by main.py)
+OWNER_CHAT_ID = 0 # REPLACE WITH YOUR TELEGRAM USER ID
+DRIVES = {
+    "1": {"name": "Depot7_Open_Paper", "folder_id": "YOUR_FOLDER_ID_1"},
+    "2": {"name": "Depot6_Index_Paper", "folder_id": "YOUR_FOLDER_ID_2"},
+    "3": {"name": "Depot26_Deep_Sea", "folder_id": "YOUR_FOLDER_ID_3"},
+    "4": {"name": "Depot2_Common_Drive", "folder_id": "YOUR_FOLDER_ID_4"},
+}
+FIXED_DRIVE = None
+
+# 3. Argument Parsing
+parser = argparse.ArgumentParser(description="File-Saver-Wydia-Bot")
+parser.add_argument("--drive", help="Target drive folder ID", default=None)
+ARGS = parser.parse_args()
+
+# 4. Paths
+LOCAL_DOWNLOAD_PATH = "downloads"
+os.makedirs(LOCAL_DOWNLOAD_PATH, exist_ok=True)
+
+# 5. Google Drive Initialization
+SERVICE_ACCOUNT_FILE = 'credentials.json'
+SCOPES = ['https://www.googleapis.com/auth/drive']
+
+def _init_drive():
+    if not os.path.exists(SERVICE_ACCOUNT_FILE):
+        log.warning(f"CRITICAL: Missing {SERVICE_ACCOUNT_FILE}. Drive upload will fail.")
+        return None
+    try:
+        creds = service_account.Credentials.from_service_account_file(
+            SERVICE_ACCOUNT_FILE, scopes=SCOPES
+        )
+        return build('drive', 'v3', credentials=creds)
+    except Exception as e:
+        log.error(f"Drive auth error: {e}")
+        return None
+
+drive_service = _init_drive()
+log.info("Configuration and services loaded successfully.")
