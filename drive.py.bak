@@ -19,8 +19,7 @@ def upload_to_drive(local_path: str, file_name: str, folder_id: str, progress_ca
             request = drive_service.files().create(
                 body=file_metadata,
                 media_body=media,
-                fields='id, webViewLink',
-                supportsAllDrives=True,
+                fields='id, webViewLink'
             )
             
             response = None

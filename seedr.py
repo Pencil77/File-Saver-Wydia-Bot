@@ -62,7 +62,7 @@ def download_file(file_id: int, file_name: str, token: str, dest_dir: str = LOCA
     for attempt in range(3):
         try:
             url = _get(f"file/{file_id}", token).get("url")
-            with httpx.stream("GET", url, headers=_headers(token), timeout=None, follow_redirects=True) as resp:
+            with httpx.stream("GET", url, timeout=None, follow_redirects=True) as resp:
                 resp.raise_for_status()
                 total = int(resp.headers.get("content-length", 0))
                 downloaded = 0

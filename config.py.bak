@@ -26,19 +26,12 @@ SEEDR_TOKEN = os.getenv("SEEDR_TOKEN")
 BOT_TOKEN = TELEGRAM_BOT_TOKEN
 
 # main.py expects a list of drive dicts, not a dict keyed by numbers.
-DRIVES = []
-
-_raw_drives = os.getenv("GOOGLE_DRIVES", "")
-for entry in _raw_drives.split(","):
-    entry = entry.strip()
-    if not entry:
-        continue
-    name, folder_id = entry.split(":", 1)
-    DRIVES.append({
-        "name": name.strip(),
-        "folder_id": folder_id.strip(),
-    })
-
+DRIVES = [
+    {"name": "Depot7_Open_Paper", "folder_id": os.getenv("FOLDER_ID_1")},
+    {"name": "Depot6_Index_Paper", "folder_id": os.getenv("FOLDER_ID_2")},
+    {"name": "Depot26_Deep_Sea", "folder_id": os.getenv("FOLDER_ID_3")},
+    {"name": "Depot2_Common_Drive", "folder_id": os.getenv("FOLDER_ID_4")},
+]
 FIXED_DRIVE = os.getenv("FIXED_DRIVE")
 
 parser = argparse.ArgumentParser(description="File-Saver-Wydia-Bot")
@@ -49,7 +42,7 @@ parser.add_argument("--notify-startup", dest="notify_startup", action="store_tru
 parser.add_argument("--no-notify-startup", dest="notify_startup", action="store_false")
 ARGS = parser.parse_args()
 
-SERVICE_ACCOUNT_FILE = os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE", "service-account.json")
+SERVICE_ACCOUNT_FILE = "credentials.json"
 SCOPES = ["https://www.googleapis.com/auth/drive"]
 
 
