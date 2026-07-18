@@ -18,4 +18,4 @@ __pycache__/
 /tmp/
 file2link_downloads/
 *.log
-
+*.bak
