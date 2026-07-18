@@ -62,7 +62,6 @@ pending_magnets: dict = {}   # token -> magnet string
 # ---------------------------------------------------------------------------
 shutdown_event = asyncio.Event()
 shutting_down = False
-seedr_lock = asyncio.Lock()
 
 magnet_queue = asyncio.Queue()
 
@@ -127,6 +126,18 @@ async def safe_edit(msg, text: str):
         await msg.edit_text(text)
     except Exception:
         pass
+
+
+class _ReplyProxy:
+    """Lets upload_local_to_drive() send its final message to a chat_id
+    directly, for callers (like the magnet flow) that don't have a
+    pyrogram Message to reply to."""
+    def __init__(self, chat_id, bot):
+        self._cid = chat_id
+        self._bot = bot
+
+    async def reply_text(self, text):
+        await self._bot.send_message(self._cid, text)
 
 
 def drive_choice_buttons(token: str) -> InlineKeyboardMarkup:
@@ -259,7 +270,6 @@ async def process_tg_upload(message, drive: dict, status_msg=None):
     except Exception as e:
         pbar.close()
         remove_transfer(dl_tid)
-        remove_transfer(locals().get("ul_tid", ""))
         log.exception(f"TG upload failed: {file_name}")
         if os.path.exists(local_path):
             os.remove(local_path)
@@ -274,15 +284,14 @@ async def process_tg_upload(message, drive: dict, status_msg=None):
 # ---------------------------------------------------------------------------
 
 async def process_magnet(magnet: str, drive: dict, chat_id, status_msg):
-    async with seedr_lock:
-        if not SEEDR_TOKEN:
-            await safe_edit(
-                status_msg,
-                "❌ SEEDR_TOKEN not set in .env — magnet links not available."
-            )
-            return
+    if not SEEDR_TOKEN:
+        await safe_edit(
+            status_msg,
+            "❌ SEEDR_TOKEN not set in .env — magnet links not available."
+        )
+        return
 
-        loop = asyncio.get_event_loop()
+    loop = asyncio.get_event_loop()
     
     # State tracking variables for the finally block
     torrent_id = None
@@ -364,14 +373,6 @@ async def process_magnet(magnet: str, drive: dict, chat_id, status_msg):
                         ),
                         loop,
                     )
-
-            # Use a fake message object as reply target for final link reply
-            class _ReplyProxy:
-                def __init__(self, chat_id, bot):
-                    self._cid = chat_id
-                    self._bot = bot
-                async def reply_text(self, text):
-                    await self._bot.send_message(self._cid, text)
 
             try:
                 await loop.run_in_executor(
@@ -726,3 +727,4 @@ if __name__ == "__main__":
         loop.run_until_complete(main())
     except KeyboardInterrupt:
         log.info("Interrupted by user (Ctrl+C).")
+

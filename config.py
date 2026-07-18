@@ -19,6 +19,9 @@ log = logging.getLogger(__name__)
 TELEGRAM_API_ID = os.getenv("API_ID") or os.getenv("TELEGRAM_API_ID")
 TELEGRAM_API_HASH = os.getenv("API_HASH") or os.getenv("TELEGRAM_API_HASH")
 TELEGRAM_BOT_TOKEN = os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
+if not (TELEGRAM_API_ID and TELEGRAM_API_HASH and TELEGRAM_BOT_TOKEN):
+    raise SystemExit("Missing TELEGRAM_API_ID / TELEGRAM_API_HASH / TELEGRAM_BOT_TOKEN in .env")
+TELEGRAM_API_ID = int(TELEGRAM_API_ID)
 OWNER_CHAT_ID = int(os.getenv("OWNER_CHAT_ID") or os.getenv("TELEGRAM_OWNER_CHAT_ID") or 0)
 SEEDR_TOKEN = os.getenv("SEEDR_TOKEN")
 
@@ -39,8 +42,6 @@ for entry in _raw_drives.split(","):
         "folder_id": folder_id.strip(),
     })
 
-FIXED_DRIVE = os.getenv("FIXED_DRIVE")
-
 parser = argparse.ArgumentParser(description="File-Saver-Wydia-Bot")
 parser.add_argument("--drive", default=None)
 parser.add_argument("--auto-stop-minutes", type=float, default=None)
@@ -48,6 +49,24 @@ parser.add_argument("--auto-stop-mode", choices=["hard", "soft"], default="soft"
 parser.add_argument("--notify-startup", dest="notify_startup", action="store_true", default=True)
 parser.add_argument("--no-notify-startup", dest="notify_startup", action="store_false")
 ARGS = parser.parse_args()
+
+FIXED_DRIVE = None
+if len(DRIVES) == 1:
+    FIXED_DRIVE = DRIVES[0]
+    log.info(f"Only one drive configured — using '{FIXED_DRIVE['name']}' for all uploads.")
+elif ARGS.drive is not None:
+    try:
+        drive_idx = int(ARGS.drive)
+    except ValueError:
+        raise SystemExit(f"--drive must be a number between 1 and {len(DRIVES)}")
+    if not (1 <= drive_idx <= len(DRIVES)):
+        raise SystemExit(f"--drive must be between 1 and {len(DRIVES)}")
+    FIXED_DRIVE = DRIVES[drive_idx - 1]
+    log.info(f"Using fixed drive: '{FIXED_DRIVE['name']}' (no prompting)")
+else:
+    log.info("No --drive given. Will prompt per file: " + ", ".join(
+        f"{i+1}={d['name']}" for i, d in enumerate(DRIVES)
+    ))
 
 SERVICE_ACCOUNT_FILE = os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE", "service-account.json")
 SCOPES = ["https://www.googleapis.com/auth/drive"]
@@ -72,3 +91,4 @@ os.makedirs(LOCAL_DOWNLOAD_PATH, exist_ok=True)
 
 def is_admin(chat_id) -> bool:
     return bool(OWNER_CHAT_ID) and str(chat_id) == str(OWNER_CHAT_ID)
+

@@ -21,8 +21,6 @@ def _get(path: str, token: str, **params) -> dict:
 
 def _post(path: str, token: str, data: dict) -> dict:
     resp = httpx.post(f"{BASE_URL}/{path}", headers=_headers(token), data=data, timeout=30)
-    print("POST STATUS:", resp.status_code)
-    print("POST BODY:", resp.text)
     resp.raise_for_status()
     return resp.json()
 
@@ -35,14 +33,20 @@ def add_magnet(magnet: str, token: str) -> int:
     hash_match = re.search(r"xt=urn:btih:([a-zA-Z0-9]+)", magnet, re.IGNORECASE)
     if hash_match:
         magnet = f"magnet:?xt=urn:btih:{hash_match.group(1)}"
-    print("MAGNET LEN:", len(magnet), "PREFIX:", magnet[:120])
+    log.info(f"Seedr: submitting magnet ({magnet[:60]}...)")
     result = _post("transfer/magnet", token, {"magnet": magnet})
     if result.get("error"):
         raise RuntimeError(f"Seedr API Error: {result.get('error')}")
     return result["user_torrent_id"]
 
+POLL_TIMEOUT = 3600  # give up after 1 hour if a torrent never finishes
+
+
 def poll_torrent(torrent_id: int, token: str, progress_cb=None) -> dict:
+    deadline = time.monotonic() + POLL_TIMEOUT
     while True:
+        if time.monotonic() > deadline:
+            raise TimeoutError(f"Seedr torrent {torrent_id} didn't finish within {POLL_TIMEOUT}s")
         status = _get(f"torrent/{torrent_id}", token)
         if progress_cb:
             progress_cb(status.get("name", "torrent"), status.get("progress", 0), status.get("size", 0))
@@ -104,4 +108,5 @@ def clear_seedr(token: str):
             log.info(f"Deleted Seedr folder: {folder['id']}")
         except Exception as e:
             log.warning(f"Couldn't delete folder {folder['id']}: {e}")
+
 

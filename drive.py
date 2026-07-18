@@ -15,7 +15,7 @@ def upload_to_drive(local_path: str, file_name: str, folder_id: str, progress_ca
     max_retries = 3
     for attempt in range(max_retries):
         try:
-            media = MediaFileUpload(local_path, resumable=True)
+            media = MediaFileUpload(local_path, resumable=True, chunksize=50 * 1024 * 1024)
             request = drive_service.files().create(
                 body=file_metadata,
                 media_body=media,
@@ -42,3 +42,4 @@ def upload_to_drive(local_path: str, file_name: str, folder_id: str, progress_ca
             else:
                 log.error(f"Upload failed after {max_retries} attempts.")
                 raise e
+
