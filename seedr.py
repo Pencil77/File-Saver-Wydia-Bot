@@ -90,3 +90,18 @@ def delete_folder(folder_id: int, token: str):
 
 def delete_torrent(torrent_id: int, token: str):
     _delete(f"torrent/{torrent_id}", token)
+
+def clear_seedr(token: str):
+    """
+    Delete every folder and torrent from Seedr.
+    Safe to call at startup.
+    """
+    # Delete folders
+    folders = _get("folder", token).get("folders", [])
+    for folder in folders:
+        try:
+            _delete(f"folder/{folder['id']}", token)
+            log.info(f"Deleted Seedr folder: {folder['id']}")
+        except Exception as e:
+            log.warning(f"Couldn't delete folder {folder['id']}: {e}")
+

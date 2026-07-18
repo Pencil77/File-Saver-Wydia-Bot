@@ -32,7 +32,7 @@ from config import (
 from drive import upload_to_drive
 from seedr import (
     add_magnet, delete_folder, delete_torrent,
-    download_file, list_files, poll_torrent,
+    download_file, list_files, poll_torrent, clear_seedr,
 )
 from transfers import (
     active_transfers,
@@ -62,6 +62,9 @@ pending_magnets: dict = {}   # token -> magnet string
 # ---------------------------------------------------------------------------
 shutdown_event = asyncio.Event()
 shutting_down = False
+seedr_lock = asyncio.Lock()
+
+magnet_queue = asyncio.Queue()
 
 
 async def initiate_shutdown(mode: str, notify_chat_id=None):
@@ -176,20 +179,23 @@ async def upload_local_to_drive(
                 loop,
             )
 
-    link = await loop.run_in_executor(
-        None,
-        lambda: upload_to_drive(local_path, file_name, drive["folder_id"], upload_progress),
-    )
-    remove_transfer(ul_tid)
-    os.remove(local_path)
+    try:
+        link = await loop.run_in_executor(
+            None,
+            lambda: upload_to_drive(local_path, file_name, drive["folder_id"], upload_progress),
+        )
 
-    await safe_edit(status_msg, f"🏁 **Task Finished:** `{file_name}`")
-    await reply_target.reply_text(
-        f"✅ **Saved to Drive!**\n\n"
-        f"📂 **Drive:** `{drive['name']}`\n"
-        f"💾 **File:** `{file_name}`\n"
-        f"🔗 **Link:** {link}"
-    )
+        await safe_edit(status_msg, f"🏁 **Task Finished:** `{file_name}`")
+        await reply_target.reply_text(
+            f"✅ **Saved to Drive!**\n\n"
+            f"📂 **Drive:** `{drive['name']}`\n"
+            f"💾 **File:** `{file_name}`\n"
+            f"🔗 **Link:** {link}"
+        )
+    finally:
+        remove_transfer(ul_tid)
+        if os.path.exists(local_path):
+            os.remove(local_path)
 
 
 # ---------------------------------------------------------------------------
@@ -268,11 +274,15 @@ async def process_tg_upload(message, drive: dict, status_msg=None):
 # ---------------------------------------------------------------------------
 
 async def process_magnet(magnet: str, drive: dict, chat_id, status_msg):
-    if not SEEDR_TOKEN:
-        await safe_edit(status_msg, "❌ SEEDR_TOKEN not set in .env — magnet links not available.")
-        return
+    async with seedr_lock:
+        if not SEEDR_TOKEN:
+            await safe_edit(
+                status_msg,
+                "❌ SEEDR_TOKEN not set in .env — magnet links not available."
+            )
+            return
 
-    loop = asyncio.get_event_loop()
+        loop = asyncio.get_event_loop()
     
     # State tracking variables for the finally block
     torrent_id = None
@@ -373,8 +383,9 @@ async def process_magnet(magnet: str, drive: dict, chat_id, status_msg):
             except Exception as e:
                 log.error(f"DOWNLOAD FAILED: {file_name}: {e}")
                 continue
-            pbar.close()
-            remove_transfer(dl_tid)
+            finally:
+                pbar.close()
+                remove_transfer(dl_tid)
 
             await safe_edit(
                 status_msg,
@@ -400,7 +411,10 @@ async def process_magnet(magnet: str, drive: dict, chat_id, status_msg):
         # 5. Guaranteed Cleanup of Seedr to free quota
         if folder_id:
             try:
-                pass  # TEMP disable cleanup
+                await loop.run_in_executor(
+                    None,
+                    lambda: delete_folder(folder_id, SEEDR_TOKEN)
+                )
                 log.info(f"Seedr cleanup done for folder {folder_id}")
             except Exception as e:
                 log.error(f"Failed to delete folder {folder_id} from Seedr: {e}")
@@ -411,6 +425,15 @@ async def process_magnet(magnet: str, drive: dict, chat_id, status_msg):
                 log.info(f"Seedr cleanup done for torrent {torrent_id}")
             except Exception as e:
                 log.error(f"Failed to delete torrent {torrent_id} from Seedr: {e}")
+
+
+async def magnet_worker():
+    while True:
+        magnet, drive, chat_id, status_msg = await magnet_queue.get()
+        try:
+            await process_magnet(magnet, drive, chat_id, status_msg)
+        finally:
+            magnet_queue.task_done()
 
 
 # ---------------------------------------------------------------------------
@@ -522,8 +545,8 @@ async def cmd_magnet(client, message):
     magnet = parts[1].strip()
 
     if FIXED_DRIVE is not None:
-        status_msg = await message.reply_text("🌱 Processing magnet link...")
-        asyncio.create_task(process_magnet(magnet, FIXED_DRIVE, message.chat.id, status_msg))
+        status_msg = await message.reply_text("📥 Added to queue...")
+        await magnet_queue.put((magnet, FIXED_DRIVE, message.chat.id, status_msg))
         return
 
     # Ask which drive
@@ -634,7 +657,8 @@ async def handle_magnet_drive_choice(client, callback_query):
     await callback_query.answer(f"Processing via Seedr → {drive['name']}...")
     status_msg = callback_query.message
     await status_msg.edit_reply_markup(reply_markup=None)
-    asyncio.create_task(process_magnet(magnet, drive, callback_query.message.chat.id, status_msg))
+    await magnet_queue.put((magnet, drive, callback_query.message.chat.id, status_msg))
+    await status_msg.edit_text("📥 Added to queue...")
 
 
 # ---------------------------------------------------------------------------
@@ -656,6 +680,18 @@ async def main():
             BotCommand("help",   "List available commands"),
         ])
 
+        if SEEDR_TOKEN:
+            try:
+                await asyncio.get_running_loop().run_in_executor(
+                    None,
+                    lambda: clear_seedr(SEEDR_TOKEN)
+                )
+                log.info("Seedr cleaned on startup.")
+            except Exception as e:
+                log.warning(f"Startup Seedr cleanup failed: {e}")
+
+        asyncio.create_task(magnet_worker())
+        log.info("Magnet worker started.")
         log.info("Bot is listening...")
 
         if ARGS.notify_startup and OWNER_CHAT_ID:
