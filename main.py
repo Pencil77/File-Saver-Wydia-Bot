@@ -363,11 +363,16 @@ async def process_magnet(magnet: str, drive: dict, chat_id, status_msg):
                 async def reply_text(self, text):
                     await self._bot.send_message(self._cid, text)
 
-            await loop.run_in_executor(
-                None, lambda fi=file_info: download_file(
-                    fi["id"], fi["name"], SEEDR_TOKEN, LOCAL_DOWNLOAD_PATH, dl_progress
+            try:
+                await loop.run_in_executor(
+                    None,
+                    lambda fi=file_info: download_file(
+                        fi["id"], fi["name"], SEEDR_TOKEN, LOCAL_DOWNLOAD_PATH, dl_progress
+                    ),
                 )
-            )
+            except Exception as e:
+                log.error(f"DOWNLOAD FAILED: {file_name}: {e}")
+                continue
             pbar.close()
             remove_transfer(dl_tid)
 
@@ -395,7 +400,7 @@ async def process_magnet(magnet: str, drive: dict, chat_id, status_msg):
         # 5. Guaranteed Cleanup of Seedr to free quota
         if folder_id:
             try:
-                await loop.run_in_executor(None, lambda: delete_folder(folder_id, SEEDR_TOKEN))
+                pass  # TEMP disable cleanup
                 log.info(f"Seedr cleanup done for folder {folder_id}")
             except Exception as e:
                 log.error(f"Failed to delete folder {folder_id} from Seedr: {e}")

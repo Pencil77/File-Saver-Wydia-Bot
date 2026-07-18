@@ -27,7 +27,10 @@ def upload_to_drive(local_path: str, file_name: str, folder_id: str, progress_ca
             while response is None:
                 status, response = request.next_chunk()
                 if status and progress_callback:
-                    progress_callback(status)
+                    progress_callback(
+                        int(status.resumable_progress),
+                        media.size(),
+                    )
             
             return response.get('webViewLink')
             

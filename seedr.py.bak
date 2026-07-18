@@ -21,8 +21,6 @@ def _get(path: str, token: str, **params) -> dict:
 
 def _post(path: str, token: str, data: dict) -> dict:
     resp = httpx.post(f"{BASE_URL}/{path}", headers=_headers(token), data=data, timeout=30)
-    print("POST STATUS:", resp.status_code)
-    print("POST BODY:", resp.text)
     resp.raise_for_status()
     return resp.json()
 
@@ -64,9 +62,7 @@ def download_file(file_id: int, file_name: str, token: str, dest_dir: str = LOCA
     local_path = os.path.join(dest_dir, file_name)
     for attempt in range(3):
         try:
-            info = _get(f"file/{file_id}", token)
-            log.info(f"Seedr file info for {file_name}: {info}")
-            url = info.get("url")
+            url = _get(f"file/{file_id}", token).get("url")
             with httpx.stream("GET", url, timeout=None, follow_redirects=True) as resp:
                 resp.raise_for_status()
                 total = int(resp.headers.get("content-length", 0))
